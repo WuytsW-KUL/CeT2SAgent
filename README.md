@@ -1,7 +1,7 @@
 # CeT2S-Agent
 
-A FastAPI service that converts natural language questions to SPARQL queries using LLM technology.
-Developed by Willem Wuyts as part of my Thesis
+A FastAPI service that converts natural language questions to SPARQL queries using LLM technology. 
+Developed by Willem Wuyts as part of my Thesis. 
 Claude Code was used to develop the CeT2S-Agent
 
 ## Setup
