@@ -1,0 +1,42 @@
+import logging
+from langchain_core.messages import SystemMessage, HumanMessage
+
+logger = logging.getLogger(__name__)
+
+
+def translate_question(question: str, llm, use_llm: bool = False) -> str:
+    """
+    Always sends question to the LLM.
+    LLM decides whether to keep it or translate it to English.
+    """
+
+    if not question:
+        raise ValueError("Empty question provided.")
+
+    return _translate_with_llm(question, llm)
+
+
+def _translate_with_llm(text: str, llm) -> str:
+    """
+    Sends the text to the LLM with smart prompt engineering.
+    """
+
+    try:
+        user_prompt = (
+            "If the question is already in English, return it unchanged. "
+            "If it is not in English, translate it into English. "
+            "Do not add, remove, or rephrase any content. "
+            "Only output the English sentence without any additional explanation.\n\n"
+            f"Question:\n{text}"
+        )
+
+        response = llm.invoke([
+            SystemMessage(content="You are a translator for any given language into English."),
+            HumanMessage(content=user_prompt)
+        ])
+
+        translated_text = response.content.strip()
+        return translated_text
+
+    except Exception as e:
+        raise RuntimeError(f"Translation failed: {e}")

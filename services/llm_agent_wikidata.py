@@ -14,17 +14,21 @@ import json
 import logging
 import time
 
-from services.llm_utils import get_expected_answer_type
-from services.context_graph_dbpedia import make_context_graph
+from services.llm_utils import (
+    get_expected_answer_type,
+)
+from services.context_graph_wikidata import make_context_graph_wikidata
 from services.sparql_graph import make_sparql_agent, make_sparql_graph
-from services.ld_utils import post_process
+from services.ld_utils import post_process_wikidata, execute_wikidata
 from model.agent import PlanExecute
-from prompts.dbpedia import system_prompt
+from prompts.wikidata import system_prompt, sparql_agent_prompt, generation_prompt, check_result_prompt
 
 
-class LLMAgentDBpedia:
+class LLMAgentWikidata:
     """
-    Implementation of an LLM agent that converts natural language to SPARQL over DBpedia.
+    LLM agent that converts natural language to SPARQL over Wikidata.
+    Mirrors LLMAgentDBpedia but uses Wikidata entity linking, entity profile generation,
+    and rate-limit-safe SPARQL execution. No categories step.
     """
 
     def __init__(
@@ -36,7 +40,7 @@ class LLMAgentDBpedia:
         ):
 
         load_dotenv()
-        self.sparql_endpoint = "https://dbpedia.org/sparql"
+        self.sparql_endpoint = os.getenv("WIKIDATA_SPARQL_URL", "https://query.wikidata.org/sparql")
         self.lang = lang
         self.embedding_model_name = embedding_model_name
         self.model_name = model_name
@@ -52,7 +56,7 @@ class LLMAgentDBpedia:
         ### END Initialize embeddings
 
         ### START Load ICL VDB
-        icl_file_path = f"./data/datasets/qald_9_plus_train_dbpedia_{lang}.json"
+        icl_file_path = f"./data/datasets/qald_9_plus_train_wikidata_{lang}.json"
         with open(icl_file_path, "r", encoding='utf-8') as f:
             self.icl_json_data = json.load(f)
 
@@ -89,47 +93,50 @@ class LLMAgentDBpedia:
             callbacks=[self.log_handler]
         )
 
-        self._context_graph = make_context_graph(
-            self.llm, self.llm, self.llm,
-            categories_llm=self.llm, log_calls=log_calls
+        self._context_graph = make_context_graph_wikidata(
+            self.llm, self.llm, self.llm, log_calls=log_calls
         )
 
-        self._sparql_agent = make_sparql_agent(self.llm, self.sparql_endpoint, self.lang)
-        self._sparql_graph = make_sparql_graph(self.llm, self.llm)
+        self._sparql_agent = make_sparql_agent(
+            self.llm,
+            self.sparql_endpoint,
+            self.lang,
+            agent_prompt=sparql_agent_prompt,
+            execute_fn=execute_wikidata,
+        )
+        self._sparql_graph = make_sparql_graph(
+            self.llm,
+            self.llm,
+            gen_prompt=generation_prompt,
+            check_prompt=check_result_prompt,
+            execute_fn=execute_wikidata,
+        )
 
-        self.app = None  # reset workflow on model change
+        self.app = None
         self.current_model = model_name
 
-    def _translate_step(self, nlq: str, use_llm_translate: bool = True) -> str:
+    def _translate_step(self, nlq: str):
         try:
-            translated_question = translate_question(nlq, self.llm, use_llm=use_llm_translate)
+            translated_question = translate_question(nlq, self.llm)
         except Exception as e:
             logging.warning(f"Translation failed, using original question: {e}")
             translated_question = nlq
         log_message(step_name="Translated question", color="Yellow", messages=[translated_question])
         return translated_question
 
-    def _get_similar_examples_step(self, state: PlanExecute):
-        _t0 = time.perf_counter()
-        icl_message = self.get_similar_examples(state["input"])
-        self._step_times.append(f"icl: {time.perf_counter() - _t0:.2f}s")
-        return {"chat_history": state["chat_history"] + [HumanMessage(icl_message)]}
+    def _get_similar_examples_step(self, chat_history: list, nlq: str):
+        icl_message = self.get_similar_examples(nlq)
+        chat_history.append(HumanMessage(icl_message))
 
-    def _eat_step(self, state: PlanExecute):
-        """Classify expected answer type and append it to chat_history."""
-        _t0 = time.perf_counter()
+    def _eat_step(self, chat_history: list, nlq: str):
         try:
-            expected_answer_type = get_expected_answer_type(state["input"], self.llm)
+            expected_answer_type = get_expected_answer_type(nlq, self.llm)
             eat = expected_answer_type["expected_answer_type"]["eat"]
             eat_message = f"Expected answer type: {eat}"
+            chat_history.append(AIMessage(eat_message))
             log_message(step_name="Expected answer type", color="Yellow", messages=[eat])
         except Exception as e:
-            eat_message = ""
             log_message(step_name="Expected answer type failed", color="Red", messages=[str(e)])
-        self._step_times.append(f"eat: {time.perf_counter() - _t0:.2f}s")
-        if eat_message:
-            return {"chat_history": state["chat_history"] + [AIMessage(eat_message)]}
-        return {}
 
     def _context_step(self, state: PlanExecute):
         result = self._context_graph.invoke({
@@ -138,53 +145,34 @@ class LLMAgentDBpedia:
             "failed_attempts": [],
             "entities": [],
             "entity_uris": [],
-            "categories": [],
             "entity_profile": "",
             "check_valid": False,
             "check_reason": "",
             "accepted_entity_profile": None,
             "accepted_entity_uris": None,
-            "accepted_categories": None,
-            "step_times": {"extraction": [], "el": [], "dbc": [], "entity_profile": [], "check": []},
+            "step_times": {"extraction": [], "el": [], "entity_profile": [], "check": []},
         })
 
         accepted_entity_profile = result.get("accepted_entity_profile") or result.get("entity_profile") or "No entity profile generated."
         entity_uris = result.get("accepted_entity_uris") or result.get("entity_uris") or []
-        categories = result.get("accepted_categories") or result.get("categories") or []
-
-        annotated_lines = []
-        for line in accepted_entity_profile.splitlines():
-            if line.lstrip().startswith("dbp:"):
-                annotated_lines.append(line + "  [USE dbp:, NOT dbo:]")
-            else:
-                annotated_lines.append(line)
-        annotated_entity_profile = "\n".join(annotated_lines)
 
         context_msg = (
             f"Entity URIs: {json.dumps(entity_uris)}\n"
-            f"Entity Profile:\n{annotated_entity_profile}"
+            f"Entity Profile:\n{accepted_entity_profile}"
         )
-        if categories:
-            cats_str = "\n".join(f"  {c['uri']}  ({c['label']})" for c in categories)
-            context_msg += f"\nDBpedia Categories (dbc:):\n{cats_str}"
         log_message(step_name="Context generated", color="Yellow", messages=[context_msg])
         self._step_times.append({"context": result.get("step_times", {})})
         return {"chat_history": state["chat_history"] + [AIMessage(content=context_msg)]}
 
     def _sparql_loop_step(self, state: PlanExecute):
         _t0 = time.perf_counter()
-        # Agent invoke (make_sparql_agent)
-
         final_query = self._call_sparql_agent_or_graph(state["input"], state["chat_history"], agent_mode=True)
-
-        
         log_message(step_name="SPARQL loop result", color="Yellow", messages=[final_query])
         self._step_times.append(f"sparql_loop: {time.perf_counter() - _t0:.2f}s")
         return {"chat_history": state["chat_history"] + [AIMessage(final_query)]}
 
     def _call_sparql_agent_or_graph(self, question: str, chat_history: list, agent_mode: bool = True):
-        # Agent invoke (make_sparql_agent)
-        if(agent_mode):
+        if agent_mode:
             result = self._sparql_agent.invoke({
                 "question": question,
                 "chat_history": chat_history,
@@ -205,25 +193,17 @@ class LLMAgentDBpedia:
             final_query = result.get("query", "")
         return final_query
 
-    def _init_workflow(self, use_eat: bool = True, use_icl: bool = True, use_context: bool = True):
+    def _init_workflow(self, use_context: bool = True):
         workflow = StateGraph(PlanExecute)
 
-        steps = []
-        if use_eat:
-            workflow.add_node("eat", self._eat_step)
-            steps.append("eat")
-        if use_icl:
-            workflow.add_node("icl", self._get_similar_examples_step)
-            steps.append("icl")
         if use_context:
             workflow.add_node("context", self._context_step)
-            steps.append("context")
-        workflow.add_node("sparql_loop", self._sparql_loop_step)
-        steps.append("sparql_loop")
-
-        workflow.set_entry_point(steps[0])
-        for i in range(len(steps) - 1):
-            workflow.add_edge(steps[i], steps[i + 1])
+            workflow.add_node("sparql_loop", self._sparql_loop_step)
+            workflow.set_entry_point("context")
+            workflow.add_edge("context", "sparql_loop")
+        else:
+            workflow.add_node("sparql_loop", self._sparql_loop_step)
+            workflow.set_entry_point("sparql_loop")
         workflow.add_edge("sparql_loop", END)
 
         self.app = workflow.compile()
@@ -241,35 +221,14 @@ class LLMAgentDBpedia:
         log_message(step_name="Similar examples retrieved for ICL", color="Yellow", messages=[example])
         return example
 
-    def generate_sparql(
-            self, input_question: str, 
-            model_name: str = "openai/gpt-4o-mini", 
-            log_calls: bool = True, 
-            temperature: float = 0, 
-            use_translate: bool = True, 
-            use_icl: bool = True, use_eat: bool = True, 
-            use_context: bool = True, 
-            use_llm_translate: bool = True
-            ) -> dict:
-        """
-        Convert a natural language question to a SPARQL query.
-
-        Args:
-            input_question: The natural language question
-            model_name: OpenRouter model identifier (e.g. "openai/gpt-4o-mini")
-            log_calls: If True, log LLM calls
-            temperature: The temperature for LLM sampling
-            use_llm_translate: If True, use LLM for translation
-
-        Returns:
-            Dict with translated_question, query, prompt_tokens, completion_tokens, requests
-        """
+    def generate_sparql(self, input_question: str, model_name: str = "openai/gpt-4o-mini", log_calls: bool = True, temperature: float = 0, use_translate: bool = True, use_icl: bool = True, use_eat: bool = True, use_context: bool = True) -> dict:
+        """Convert a natural language question to a SPARQL query over Wikidata."""
         try:
             if model_name != self.current_model or temperature != self.llm.temperature:
                 self._init_llm(model_name, log_calls=log_calls, temperature=temperature)
             if self.app is None or (use_icl, use_eat, use_context) != (self._use_icl, self._use_eat, self._use_context):
                 self._use_icl, self._use_eat, self._use_context = use_icl, use_eat, use_context
-                self._init_workflow(use_eat=use_eat, use_icl=use_icl, use_context=use_context)
+                self._init_workflow(use_context=use_context)
 
             self._step_times = []
             self.log_handler.reset(input_question, enabled=log_calls)
@@ -280,12 +239,21 @@ class LLMAgentDBpedia:
             with get_openai_callback() as cb:
                 if use_translate:
                     _t0 = time.perf_counter()
-                    translated_question = self._translate_step(input_question, use_llm_translate=use_llm_translate)
+                    translated_question = self._translate_step(input_question)
                     self._step_times.append(f"translation: {time.perf_counter() - _t0:.2f}s")
                 else:
                     translated_question = input_question
 
-                _t0 = time.perf_counter()
+                if use_eat:
+                    _t0 = time.perf_counter()
+                    self._eat_step(chat_history, translated_question)
+                    self._step_times.append(f"eat: {time.perf_counter() - _t0:.2f}s")
+
+                if use_icl:
+                    _t0 = time.perf_counter()
+                    self._get_similar_examples_step(chat_history, translated_question)
+                    self._step_times.append(f"icl: {time.perf_counter() - _t0:.2f}s")
+
                 result = self.app.invoke(
                     {
                         "input": translated_question,
@@ -295,8 +263,7 @@ class LLMAgentDBpedia:
                 )
 
             sparql_result = result["chat_history"][-1].content
-            generated_query = post_process(sparql_result)
-            # generated_query = correct_query_prefixes(generated_query, self.profile_check_llm)
+            generated_query = post_process_wikidata(sparql_result)
             log_message(step_name="Generated SPARQL query", color="Green", messages=[generated_query])
 
             return {
@@ -309,10 +276,10 @@ class LLMAgentDBpedia:
             }
 
         except Exception as e:
-            logging.error(f"Error in generate_sparql: {e}", exc_info=True)
+            logging.error(f"Error in generate_sparql (wikidata): {e}", exc_info=True)
             return {
                 "translated_question": input_question,
-                "query": "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 1",
+                "query": "SELECT ?item WHERE { ?item wdt:P31 wd:Q5 } LIMIT 1",
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "requests": 0,
@@ -322,16 +289,14 @@ class LLMAgentDBpedia:
 
 if __name__ == "__main__":
 
-    dbpedia_agent = LLMAgentDBpedia(
+    agent = LLMAgentWikidata(
         model_name="openai/gpt-4o-mini",
         embedding_model_name="intfloat/multilingual-e5-large",
         return_N=5,
         lang="en"
     )
 
-    text = "Who is the author of the book 'The Great Gatsby'?"
-
-    query = dbpedia_agent.generate_sparql(text)
-
+    text = "Who is the author of The Hitchhiker's Guide to the Galaxy?"
+    query = agent.generate_sparql(text)
     print(f"Input: {text}")
     print(f"Output: {query}")

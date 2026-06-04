@@ -174,3 +174,7 @@ cython_debug/
 .pypirc
 
 *.db
+
+# Call logs
+logs/log_calls.json
+logs/messages.log
