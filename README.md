@@ -1,13 +1,13 @@
 ## About
 
-This project was developed as part of a Master's thesis to satisfy the requirements for the degree of Master of Science in Electronics and ICT Engineering Technology.
+This project was developed as part of a Master's thesis to satisfy the requirements for the degree of Master of Science in Electronics and ICT Engineering Technology at KULeuven.
 
 # CeT2S-Agent
 
 CeT2S-Agent is a context-enhanced text-to-SPARQL system built with FastAPI and LangGraph. It accepts a natural-language question and returns a SPARQL query for either DBpedia or Wikidata.
 
 The agent is build upon and expands on the mKGQAgent developed by the WSE-research group at Leipzig University of Applied Sciences.
-[text](https://github.com/WSE-research/text2sparql-agent)
+[mKGQAgent](https://github.com/WSE-research/text2sparql-agent)
 
 ## What this project does
 
@@ -121,4 +121,3 @@ curl "http://localhost:8000/CeT2SAgent?question=Who%20is%20the%20president%20of%
 
 - The system depends on an OpenRouter-compatible API key via `CeT2SAgent_LLM`.
 - If the dataset is unknown, the API returns an HTTP 404 error.
-- The repository also includes helper scripts for generating a defense document and PowerPoint presentation.
